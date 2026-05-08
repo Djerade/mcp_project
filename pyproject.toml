@@ -9,5 +9,6 @@ dependencies = [
     "arxiv>=3.0.0",
     "mcp>=1.27.0",
     "nest-asyncio>=1.6.0",
+    "ollama>=0.6.2",
     "python-dotenv>=1.2.2",
 ]

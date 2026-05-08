@@ -1,11 +1,12 @@
 from dotenv import load_dotenv
-from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from typing import List
 import asyncio
 import nest_asyncio
 import os
+import json
+from ollama import Client
 
 nest_asyncio.apply()
 
@@ -16,61 +17,57 @@ class MCP_ChatBot:
     def __init__(self):
         # Initialize session and client objects
         self.session: ClientSession = None
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "Missing ANTHROPIC_API_KEY. Set it in your environment or .env file."
-            )
-        self.anthropic = Anthropic(api_key=api_key)
+        self.ollama = Client(host=os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+        self.model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
         self.available_tools: List[dict] = []
 
+    @staticmethod
+    def _format_tool_result(tool_result_content):
+        if isinstance(tool_result_content, (dict, list)):
+            return json.dumps(tool_result_content, default=str)
+        return str(tool_result_content)
+
     async def process_query(self, query):
-        messages = [{'role':'user', 'content':query}]
-        response = self.anthropic.messages.create(max_tokens = 2024,
-                                      #model = 'claude-3-7-sonnet-20250219', #deprecated model
-                                      model = 'claude-sonnet-4-6',
-                                      tools = self.available_tools, # tools exposed to the LLM
-                                      messages = messages)
-        process_query = True
-        while process_query:
-            assistant_content = []
-            for content in response.content:
-                if content.type =='text':
-                    print(content.text)
-                    assistant_content.append(content)
-                    if(len(response.content) == 1):
-                        process_query= False
-                elif content.type == 'tool_use':
-                    assistant_content.append(content)
-                    messages.append({'role':'assistant', 'content':assistant_content})
-                    tool_id = content.id
-                    tool_args = content.input
-                    tool_name = content.name
-    
-                    print(f"Calling tool {tool_name} with args {tool_args}")
-                    
-                    # Call a tool
-                    #result = execute_tool(tool_name, tool_args): not anymore needed
-                    # tool invocation through the client session
-                    result = await self.session.call_tool(tool_name, arguments=tool_args)
-                    messages.append({"role": "user", 
-                                      "content": [
-                                          {
-                                              "type": "tool_result",
-                                              "tool_use_id":tool_id,
-                                              "content": result.content
-                                          }
-                                      ]
-                                    })
-                    response = self.anthropic.messages.create(max_tokens = 2024,
-                                      #model = 'claude-3-7-sonnet-20250219', #deprecated model
-                                      model = 'claude-sonnet-4-6', 
-                                      tools = self.available_tools,
-                                      messages = messages) 
-                    
-                    if(len(response.content) == 1 and response.content[0].type == "text"):
-                        print(response.content[0].text)
-                        process_query= False
+        messages = [{"role": "user", "content": query}]
+        while True:
+            response = self.ollama.chat(
+                model=self.model,
+                tools=self.available_tools,
+                messages=messages,
+            )
+            assistant_message = response.get("message", {})
+            assistant_text = assistant_message.get("content", "")
+            tool_calls = assistant_message.get("tool_calls", []) or []
+
+            if assistant_text:
+                print(assistant_text)
+
+            if not tool_calls:
+                break
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for tool_call in tool_calls:
+                function_info = tool_call.get("function", {})
+                tool_name = function_info.get("name")
+                tool_args = function_info.get("arguments", {}) or {}
+
+                print(f"Calling tool {tool_name} with args {tool_args}")
+
+                result = await self.session.call_tool(tool_name, arguments=tool_args)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "name": tool_name,
+                        "content": self._format_tool_result(result.content),
+                    }
+                )
 
     
     
@@ -112,9 +109,15 @@ class MCP_ChatBot:
                 print("\nConnected to server with tools:", [tool.name for tool in tools])
                 
                 self.available_tools = [{
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.inputSchema
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.inputSchema or {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }
                 } for tool in response.tools]
     
                 await self.chat_loop()
